@@ -1,25 +1,20 @@
 # QFPay SDK for Laravel
 
-A Laravel client for QFPay OpenAPI, Hosted Checkout, and the server side of QFPay Element. It also includes an HTTP(S) client for Haojin ECR terminals.
+Accept payments through QFPay Hosted Checkout, Element, or OpenAPI. The SDK signs requests server-side, verifies webhooks, and supports transaction enquiry, refunds, recurring billing, and Haojin ECR terminals.
 
 ## Installation
 
-Requires PHP 8.4 or newer within the PHP 8 series, OpenSSL, and Laravel 11, 12, or 13.
-
-To use the local checkout from a Laravel application before publishing a release, run these commands in the application directory.
-
-```sh
-composer config repositories.qfpay path /path/to/qfpay-sdk
-composer require ajaydhakal/qfpay-sdk:@dev
-```
-
-For a published release, use the standard Composer install command.
+Requires PHP 8.4 or newer within the PHP 8 series and OpenSSL. The SDK has been tested on Laravel 12 and 13. Composer also accepts Laravel 11, but upstream security advisories blocked its test installation.
 
 ```sh
 composer require ajaydhakal/qfpay-sdk
 ```
 
-Laravel discovers the service provider and facade. You can publish the optional config with `php artisan vendor:publish --tag=qfpay-sdk-config`. Set these values in the application's `.env` file.
+Laravel discovers the service provider and facade. To customize the package configuration, run `php artisan vendor:publish --tag=qfpay-sdk-config`. [Packagist](https://packagist.org/packages/ajaydhakal/qfpay-sdk)
+
+## Configure
+
+Set the following values in the Laravel application's environment. Start in `sandbox` with matching credentials, and use your merchant's currency, timezone, and HTTPS URLs.
 
 ```dotenv
 QFPAY_ENVIRONMENT=sandbox
@@ -29,7 +24,7 @@ QFPAY_CURRENCY=HKD
 QFPAY_TIMEZONE=Asia/Hong_Kong
 QFPAY_RETURN_URL=https://shop.example/checkout/return
 QFPAY_FAILED_URL=https://shop.example/checkout/failed
-QFPAY_NOTIFY_URL=https://shop.example/webhooks/qfpay
+QFPAY_NOTIFY_URL=https://shop.example/api/webhooks/qfpay
 ```
 
 | Variable | Purpose |
@@ -44,26 +39,25 @@ QFPAY_NOTIFY_URL=https://shop.example/webhooks/qfpay
 | `QFPAY_CURRENCY` | Optional default currency. Required by Hosted Checkout and direct payment unless supplied per order. |
 | `QFPAY_TIMEZONE` | Timezone for generated `txdtm` values. Defaults to the application's PHP timezone. |
 | `QFPAY_CONNECT_TIMEOUT`, `QFPAY_TIMEOUT` | OpenAPI timeouts in seconds. Defaults are 5 and 30. |
-| `QFPAY_VERIFY_RESPONSE_SIGNATURES` | Require the signed response-field format when your QFPay channel provides it. Defaults to false because response signatures vary by endpoint. Webhook verification is independent. |
+| `QFPAY_VERIFY_RESPONSE_SIGNATURES` | Optional global verification for signed object responses. Defaults to `false`. Enable only if every OpenAPI endpoint you use returns a compatible signature and object shape. Enquiry responses with a list in `data` are incompatible with this option. Webhook verification is independent. |
 
-Rebuild Laravel's cached configuration after changing environment variables if your deployment uses `php artisan config:cache`. QFPay assigns channel availability and credentials per merchant and environment. See [environments](https://sdk.qfapi.com/integration/preparation/environments) and [request signing](https://sdk.qfapi.com/integration/preparation/authentication-and-signature).
+Keep the client key in your server's secret store. Rebuild Laravel's cached configuration after deploying environment changes. QFPay assigns channels and credentials per merchant and environment. [Environments](https://sdk.qfapi.com/integration/preparation/environments) · [Request signing](https://sdk.qfapi.com/integration/preparation/authentication-and-signature)
 
 ## Hosted Checkout
 
-Call this from your checkout action after loading the authenticated customer's order. Use a persisted, unique merchant reference and the amount from your server in minor units.
+In an authenticated checkout action, load and authorize the order, then persist a unique payment-attempt reference before redirecting. Use the amount from your database as an integer in the currency's minor units.
 
 ```php
 use AjayDhakal\QFPay\Facades\QFPay;
 
 return redirect()->away(QFPay::checkoutUrl([
-    'out_trade_no' => $order->payment_reference,
-    'txamt' => $order->amount_in_minor_units,
-    'txcurrcd' => $order->currency,
-    'goods_name' => 'Online order',
+    'out_trade_no' => $attempt->reference,
+    'txamt' => $attempt->amount_in_minor_units,
+    'txcurrcd' => $attempt->currency,
 ]));
 ```
 
-The SDK signs on the server. The customer returns through the configured success, failure, or cancellation URL. Use those routes to display order status and use the verified webhook and transaction enquiry to confirm the payment. Match the transaction reference, amount, currency, and final status against your stored order before fulfillment. Use a new merchant reference for a new payment attempt. See [QFPay Hosted Checkout](https://sdk.qfapi.com/integration/online-shop/checkout-integration/checkout) and [Transaction Enquiry](https://sdk.qfapi.com/integration/common-api/transaction-enquiry).
+Use the browser return routes to display the current order status. Before fulfillment, query QFPay with `QFPay::query(['out_trade_no' => $attempt->reference])`. Match the payment entry's reference, amount, currency, and final status against your stored attempt. The top-level `respcd` describes the enquiry request. Check the matched transaction's result and cancellation status separately. [Hosted Checkout](https://sdk.qfapi.com/integration/online-shop/checkout-integration/checkout) · [Transaction enquiry](https://sdk.qfapi.com/integration/common-api/transaction-enquiry)
 
 ## Direct payments and Element
 
@@ -103,15 +97,16 @@ Load the script at `$element['script_url']` and use the returned `region` and `e
 
 ## Webhooks
 
-Register a public callback URL with QFPay for the relevant event family. In Laravel, use a route that can accept external POSTs. Read the original request body and verify `X-QF-SIGN` before processing it.
+Register your public HTTPS callback with QFPay. Add the example to `routes/api.php` in an application that has API routing enabled with the default `/api` prefix. Implement `App\Jobs\ProcessQFPayNotification` as a queued job and configure a durable queue before using this route.
 
 ```php
 use AjayDhakal\QFPay\Facades\QFPay;
 use AjayDhakal\QFPay\QFPayException;
+use App\Jobs\ProcessQFPayNotification;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Route;
 
-public function __invoke(Request $request)
-{
+Route::post('/webhooks/qfpay', function (Request $request) {
     try {
         $notification = QFPay::parseWebhook(
             $request->getContent(),
@@ -121,18 +116,26 @@ public function __invoke(Request $request)
         abort(400);
     }
 
-    // Application-defined handler. Persist or enqueue processing idempotently.
-    $this->recordNotification($notification);
+    ProcessQFPayNotification::dispatch($notification);
 
-    return response('SUCCESS', 200)->header('Content-Type', 'text/plain');
-}
+    return response('SUCCESS', 200, ['Content-Type' => 'text/plain']);
+});
 ```
 
-Payment and refund callbacks use MD5 over the exact body and client key. QFPay documents separate callback registration for token creation and subscription events. Confirm their signature and acknowledgement format for your account before reusing the same parser. For events using the same raw-body signature scheme, the parser preserves fields for `payment_token`, `subscription`, and `subscription_payment` as received. See [payment and refund notifications](https://sdk.qfapi.com/integration/common-api/async-notifications), [token notifications](https://sdk.qfapi.com/integration/online-shop/integration-by-use-case/saved-payment-methods/token-notification), and [subscription notifications](https://sdk.qfapi.com/integration/online-shop/integration-by-use-case/recurring-payments/recurring-webhook).
+The SDK verifies `X-QF-SIGN` over the original request body and client key. Acknowledge delivery after the event is durably queued or recorded. In the job, use `notify_type` and `syssn` to identify the transaction, verify it through enquiry, and make order updates idempotent so repeated deliveries cannot trigger duplicate fulfillment or refunds. Confirm the callback registration, signature scheme, and acknowledgement separately for token and subscription events. [Payment and refund notifications](https://sdk.qfapi.com/integration/common-api/async-notifications) · [Token notifications](https://sdk.qfapi.com/integration/online-shop/integration-by-use-case/saved-payment-methods/token-notification) · [Subscription notifications](https://sdk.qfapi.com/integration/online-shop/integration-by-use-case/recurring-payments/recurring-webhook)
+
+## Before going live
+
+1. Confirm production credentials, payment channels, the regional API host, and callback URLs with QFPay. Set `QFPAY_ENVIRONMENT=production` when switching over, refresh Laravel's configuration cache, and restart queue workers.
+2. Exercise success, cancellation, pending results, duplicate callbacks, and refunds in the QFPay test environment available to your merchant. Confirm that browser returns and repeated callbacks cannot trigger duplicate fulfillment.
+3. Keep the original `out_trade_no` when handling a timeout or ambiguous result. Query that attempt before deciding whether to submit another payment or refund. QFPay can report in-progress results with `1143` or `1145`.
+4. Log the merchant reference, QFPay transaction ID, and response code for reconciliation. Keep credentials, signatures, card data, and full callback payloads out of application logs.
+
+[QFPay integration prerequisites](https://sdk.qfapi.com/integration/preparation/before-you-begin) · [Transaction status codes](https://sdk.qfapi.com/integration/api-reference/status-codes)
 
 ## API methods
 
-Import the facade or inject `AjayDhakal\QFPay\QFPay`. API methods accept QFPay's documented field names and return the decoded response array, including provider status and channel-specific fields. Transport failures, non-2xx responses, and invalid JSON throw `QFPayException`. Check the operation's `respcd` and transaction status before changing your order. For example, `1143` and `1145` can indicate an in-progress result. Monetary calls make one request per invocation. After a timeout, query the original attempt before resubmitting it. See [transaction status codes](https://sdk.qfapi.com/integration/api-reference/status-codes).
+Import the facade or inject `AjayDhakal\QFPay\QFPay`. OpenAPI methods take QFPay's documented field names and return decoded response arrays. Connection failures, non-2xx HTTP responses, and invalid response bodies throw `QFPayException`. Check provider response codes separately. The SDK sends one request per invocation.
 
 | API | SDK methods |
 | --- | --- |
@@ -179,4 +182,4 @@ The automated tests use fake QFPay HTTP responses. Merchant and terminal end-to-
 
 ## License
 
-MIT.
+[MIT license](LICENSE.md)
